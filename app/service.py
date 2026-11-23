@@ -17,7 +17,8 @@ from .evaluation import (
     serialize_interval,
     window_intersects,
 )
-from .params import params_from_row, params_to_json
+from .params import PARAM_KEYS, params_from_row, params_to_json
+from .segments import compress_segments, plan_segment_changes
 from .timeutil import STABILIZATION, parse_utc, to_iso, utcnow
 
 REASONS = {
@@ -59,6 +60,22 @@ class CheckService:
     def _connection(self) -> Iterator[sqlite3.Connection]:
         with closing(self.database.connect()) as conn:
             yield conn
+
+    # ------------------------------------------------------------ 启动回填
+
+    def ensure_segments(self) -> None:
+        """旧 SQLite 卷启动时一次性回填工况段；新卷/已回填则空操作。
+
+        在单个事务内完成：读全量切换 → 压缩成段 → 仅当段表为空时写入。
+        后续补改走 :meth:`_maintain_segments` 的局部增量维护。
+        """
+        now = to_iso(utcnow())
+        with self._connection() as conn:
+            with transaction(conn):
+                if repo.count_segments(conn) > 0:
+                    return
+                for segment in compress_segments(repo.load_switches(conn)):
+                    repo.insert_segment(conn, segment, now=now)
 
     # ------------------------------------------------------------------ 批次
 
@@ -123,6 +140,85 @@ class CheckService:
             **detail["current_result"],
             "revision": detail["revision"],
             "revision_history": detail["revision_history"],
+        }
+
+    # ------------------------------------------------------------ 工况分组
+
+    def condition_groups(
+        self, *, start: datetime, end: datetime
+    ) -> dict:
+        """按采样开始时刻的半开区间 [start, end) 汇总工况段与合格批次。
+
+        一次只读连接、同一已提交状态：
+
+        * 工况段走 ``started_at`` 索引做区间定位（含没有样本的空段），
+          不扫描全线切换历史，也不逐条读取段内同值切换记录；
+        * 合格批次走 ``sampling_start`` 索引做范围扫描，在内存中按所属
+          工况段归组；不合格批次不入选，只计入 ``total_batch_count``。
+        """
+        start_iso = to_iso(start)
+        end_iso = to_iso(end)
+        with self._connection() as conn:
+            segment_rows = repo.find_segments_overlapping_range(conn, start, end)
+            batch_rows = repo.find_eligible_batches_in_range(conn, start, end)
+            total_in_range = repo.count_batches_in_range(conn, start, end)
+
+            segments: list[dict] = []
+            index_by_start: dict[str, int] = {}
+            for row in segment_rows:
+                index_by_start[row["started_at"]] = len(segments)
+                segments.append(
+                    {
+                        "started_at": row["started_at"],
+                        "ended_at": row["ended_at"],
+                        "parameters": params_to_json(params_from_row(row)),
+                        "batch_nos": [],
+                    }
+                )
+
+            for batch in batch_rows:
+                segment_row = repo.find_segment_for_moment(
+                    conn, parse_utc(batch["sampling_start"])
+                )
+                if segment_row is None:
+                    # 合格批次必然落在某个有效工况段内；出现即说明数据不一致。
+                    raise ServiceError(
+                        500,
+                        "segment_not_found",
+                        f"批次 {batch['batch_no']!r} 合格但找不到所属工况段，"
+                        "请检查工况段回填状态。",
+                    )
+                target = index_by_start.get(segment_row["started_at"])
+                if target is None:
+                    # 理论不可达：合格批次的工况段必与查询区间相交。
+                    raise ServiceError(
+                        500,
+                        "segment_out_of_range",
+                        f"批次 {batch['batch_no']!r} 所属工况段不在查询区间内。",
+                    )
+                segments[target]["batch_nos"].append(batch["batch_no"])
+
+            parameter_stats: dict[str, dict] = {}
+            for segment in segments:
+                param_key = dumps_key(segment["parameters"])
+                stat = parameter_stats.setdefault(
+                    param_key,
+                    {
+                        "parameters": segment["parameters"],
+                        "segment_count": 0,
+                        "batch_count": 0,
+                    },
+                )
+                stat["segment_count"] += 1
+                stat["batch_count"] += len(segment["batch_nos"])
+
+        return {
+            "query": {"start": start_iso, "end": end_iso},
+            "segments": segments,
+            "parameter_stats": list(parameter_stats.values()),
+            "segment_count": len(segments),
+            "eligible_batch_count": len(batch_rows),
+            "total_batch_count": total_in_range,
         }
 
     def _summary(self, batch: sqlite3.Row, revision: sqlite3.Row | None) -> dict:
@@ -247,6 +343,8 @@ class CheckService:
                         trigger = "switch_updated"
 
                     intervals = changed_intervals(before, repo.load_switches(conn))
+                    # 先重查批次（最易失败的业务计算），成功后再维护工况段；
+                    # 两者在同一事务内，任一步失败整体回滚，段表沿用原分组。
                     rechecked = _recheck_batches(
                         conn,
                         intervals,
@@ -254,6 +352,7 @@ class CheckService:
                         trigger_record_no=record_no,
                         now=now,
                     )
+                    segment_ops = self._maintain_segments(conn, intervals, now=now)
                     row = repo.fetch_switch(conn, record_no)
                     assert row is not None
                     payload = _switch_payload(row)
@@ -269,9 +368,19 @@ class CheckService:
             "operation": operation,
             "switch": payload,
             "changed_intervals": [serialize_interval(i) for i in intervals],
+            "segment_changes": [_segment_op_payload(op) for op in segment_ops],
             "rechecked_batches": rechecked,
             "rechecked_count": len(rechecked),
         }
+
+    def _maintain_segments(self, conn, intervals, *, now: str):
+        """只更新与变更时段相交的工况段；无差异时段时不动任何段。"""
+        if not intervals:
+            return []
+        old_segments = repo.load_segments(conn)
+        ops = plan_segment_changes(old_segments, repo.load_switches(conn), intervals)
+        repo.apply_segment_ops(conn, ops, now=now)
+        return ops
 
 
 def _switch_is_unchanged(
@@ -293,6 +402,23 @@ def _switch_payload(row: sqlite3.Row) -> dict:
         "parameters": params_to_json(params_from_row(row)),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+    }
+
+
+def dumps_key(parameters: dict[str, float]) -> str:
+    """规范化参数的稳定字符串键，用于按参数聚合工况段数。"""
+    return "|".join(str(parameters[key]) for key in PARAM_KEYS)
+
+
+def _segment_op_payload(op) -> dict:
+    return {
+        "operation": op.kind,
+        "started_at": to_iso(op.started_at),
+        "ended_at": None if op.ended_at is None else to_iso(op.ended_at),
+        "parameters": params_to_json(op.parameters),
+        "old_started_at": (
+            None if op.old_started_at is None else to_iso(op.old_started_at)
+        ),
     }
 
 

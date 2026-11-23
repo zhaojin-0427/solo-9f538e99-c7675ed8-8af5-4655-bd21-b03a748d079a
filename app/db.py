@@ -62,6 +62,21 @@ CREATE TABLE IF NOT EXISTS revisions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_revisions_batch ON revisions (batch_id, sequence);
+
+-- 工况段：切换时间线压缩出的「同一组参数连续运行」的极大半开区间。
+-- ended_at 为 NULL 表示该段尚未结束。随切换补改在同一事务内局部维护。
+CREATE TABLE IF NOT EXISTS condition_segments (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at      TEXT    NOT NULL UNIQUE,
+    ended_at        TEXT,
+    temperature_c   REAL    NOT NULL,
+    pressure_kpa    REAL    NOT NULL,
+    dwell_time_s    REAL    NOT NULL,
+    created_at      TEXT    NOT NULL,
+    updated_at      TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_batches_sampling_start ON batches (sampling_start);
 """
 
 

@@ -8,6 +8,7 @@ from datetime import datetime
 from .db import dumps
 from .evaluation import Switch
 from .params import params_from_row
+from .segments import ConditionSegment, SegmentOp
 from .timeutil import parse_utc, to_iso
 
 BATCH_SELECT = """
@@ -20,6 +21,12 @@ SWITCH_SELECT = """
 SELECT record_no, switched_at, temperature_c, pressure_kpa, dwell_time_s,
        created_at, updated_at
 FROM switches
+"""
+
+SEGMENT_SELECT = """
+SELECT id, started_at, ended_at, temperature_c, pressure_kpa, dwell_time_s,
+       created_at, updated_at
+FROM condition_segments
 """
 
 
@@ -228,3 +235,198 @@ def set_current_revision(
         "UPDATE batches SET current_revision = ?, updated_at = ? WHERE id = ?",
         (sequence, now, batch_id),
     )
+
+
+# ------------------------------------------------------------ 工况段
+
+
+def segment_from_row(row: sqlite3.Row) -> ConditionSegment:
+    return ConditionSegment(
+        started_at=parse_utc(row["started_at"]),
+        ended_at=None if row["ended_at"] is None else parse_utc(row["ended_at"]),
+        parameters=params_from_row(row),
+    )
+
+
+def load_segments(conn: sqlite3.Connection) -> list[ConditionSegment]:
+    rows = conn.execute(f"{SEGMENT_SELECT} ORDER BY started_at").fetchall()
+    return [segment_from_row(row) for row in rows]
+
+
+def count_segments(conn: sqlite3.Connection) -> int:
+    return int(conn.execute("SELECT COUNT(*) FROM condition_segments").fetchone()[0])
+
+
+def insert_segment(
+    conn: sqlite3.Connection, segment: ConditionSegment, *, now: str
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO condition_segments (
+            started_at, ended_at, temperature_c, pressure_kpa, dwell_time_s,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            to_iso(segment.started_at),
+            None if segment.ended_at is None else to_iso(segment.ended_at),
+            segment.parameters["seal_temperature_c"],
+            segment.parameters["seal_pressure_kpa"],
+            segment.parameters["dwell_time_s"],
+            now,
+            now,
+        ),
+    )
+
+
+def update_segment(
+    conn: sqlite3.Connection, op: SegmentOp, *, now: str
+) -> None:
+    conn.execute(
+        """
+        UPDATE condition_segments
+           SET started_at = ?, ended_at = ?, temperature_c = ?, pressure_kpa = ?,
+               dwell_time_s = ?, updated_at = ?
+         WHERE started_at = ?
+        """,
+        (
+            to_iso(op.started_at),
+            None if op.ended_at is None else to_iso(op.ended_at),
+            op.parameters["seal_temperature_c"],
+            op.parameters["seal_pressure_kpa"],
+            op.parameters["dwell_time_s"],
+            now,
+            to_iso(op.old_started_at),
+        ),
+    )
+
+
+def delete_segment(conn: sqlite3.Connection, old_started_at: datetime) -> None:
+    conn.execute(
+        "DELETE FROM condition_segments WHERE started_at = ?",
+        (to_iso(old_started_at),),
+    )
+
+
+def apply_segment_ops(
+    conn: sqlite3.Connection, ops: list[SegmentOp], *, now: str
+) -> None:
+    """按 delete → update → insert 顺序应用，避开 started_at 唯一约束。"""
+    for op in ops:
+        if op.kind == "delete":
+            assert op.old_started_at is not None
+            delete_segment(conn, op.old_started_at)
+    for op in ops:
+        if op.kind == "update":
+            update_segment(conn, op, now=now)
+    for op in ops:
+        if op.kind == "insert":
+            insert_segment(
+                conn,
+                ConditionSegment(
+                    started_at=op.started_at,
+                    ended_at=op.ended_at,
+                    parameters=op.parameters,
+                ),
+                now=now,
+            )
+
+
+def find_eligible_batches_in_range(
+    conn: sqlite3.Connection, start: datetime, end: datetime
+) -> list[sqlite3.Row]:
+    """按采样开始时刻在半开区间 [start, end) 内定位**当前合格**的批次。
+
+    走 ``idx_batches_sampling_start`` 索引做范围扫描，不读取区间外批次；
+    合格判定取每批最新修订（revisions.eligible），在 SQL 内完成关联。
+    """
+    return conn.execute(
+        """
+        SELECT b.id, b.batch_no, b.plan_temperature_c, b.plan_pressure_kpa,
+               b.plan_dwell_time_s, b.sampling_start, b.sampling_end,
+               b.created_at, b.updated_at, b.current_revision,
+               r.eligible AS eligible_flag
+          FROM batches AS b
+          JOIN revisions AS r
+            ON r.batch_id = b.id
+           AND r.sequence = b.current_revision
+         WHERE b.sampling_start >= ?
+           AND b.sampling_start < ?
+           AND r.eligible = 1
+         ORDER BY b.sampling_start, b.id
+        """,
+        (to_iso(start), to_iso(end)),
+    ).fetchall()
+
+
+def find_segments_overlapping_range(
+    conn: sqlite3.Connection, start: datetime, end: datetime
+) -> list[sqlite3.Row]:
+    """返回与半开区间 ``[start, end)`` 相交的全部工况段（含无批次的空段）。
+
+    半开相交：``started_at < end AND (ended_at IS NULL OR ended_at > start)``，
+    走 ``started_at`` 索引做范围定位，不扫描全线历史。
+    """
+    return conn.execute(
+        f"""
+        {SEGMENT_SELECT}
+         WHERE started_at < ?
+           AND (ended_at IS NULL OR ended_at > ?)
+         ORDER BY started_at
+        """,
+        (to_iso(end), to_iso(start)),
+    ).fetchall()
+
+
+def find_segment_for_moment(
+    conn: sqlite3.Connection, moment: datetime
+) -> sqlite3.Row | None:
+    """定位采样时刻所属工况段：``started_at <= moment`` 的最近一段。
+
+    走 ``condition_segments.started_at`` 唯一索引，单条索引定位；
+    不逐条读取段内的同值切换记录。
+    """
+    return conn.execute(
+        f"""
+        {SEGMENT_SELECT}
+         WHERE started_at <= ?
+         ORDER BY started_at DESC
+         LIMIT 1
+        """,
+        (to_iso(moment),),
+    ).fetchone()
+
+
+def count_batches_in_range(
+    conn: sqlite3.Connection, start: datetime, end: datetime
+) -> int:
+    """区间内全部批次数（含不合格），用于响应里的对照计数。"""
+    return int(
+        conn.execute(
+            """
+            SELECT COUNT(*) FROM batches
+             WHERE sampling_start >= ? AND sampling_start < ?
+            """,
+            (to_iso(start), to_iso(end)),
+        ).fetchone()[0]
+    )
+
+
+def count_eligible_batches_in_range(
+    conn: sqlite3.Connection, start: datetime, end: datetime
+) -> int:
+    return int(
+        conn.execute(
+            """
+            SELECT COUNT(*)
+              FROM batches AS b
+              JOIN revisions AS r
+                ON r.batch_id = b.id AND r.sequence = b.current_revision
+             WHERE b.sampling_start >= ?
+               AND b.sampling_start < ?
+               AND r.eligible = 1
+            """,
+            (to_iso(start), to_iso(end)),
+        ).fetchone()[0]
+    )
+

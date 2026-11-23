@@ -5,9 +5,13 @@ from __future__ import annotations
 import os
 from collections.abc import Iterator
 from contextlib import asynccontextmanager, closing
+from typing import Annotated
 
 from fastapi import Depends, FastAPI, Query, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError
 
 from . import __version__
 from .db import Database
@@ -16,10 +20,13 @@ from .schemas import (
     BatchDetail,
     BatchList,
     CheckResponse,
+    ConditionGroupQuery,
+    ConditionGroupResponse,
     SwitchList,
     SwitchOut,
     SwitchUpsert,
     SwitchUpsertResult,
+    condition_group_query,
 )
 from .service import CheckService, ServiceError
 
@@ -37,7 +44,15 @@ DESCRIPTION = """
   首条切换记录之前视为**未知**。
 * 切换日志按记录号补录或更正；**切换时刻全局唯一**。
 * 更正日志后只重查「检查窗口与变更时段相交」的批次，资格可撤下或恢复。
-* 切换日志与核对结果在同一事务内生效；校验失败时整体回滚，沿用原结果。
+* 切换日志、工况段与核对结果在同一事务内生效；校验失败时整体回滚，
+  沿用原结果与原工况分组。
+
+**工况分组（`GET /analysis/condition-groups`）**
+
+* 同参数连续运行的极大区间为一个工况段；同参数连续上报只算一段，
+  换成别的参数再调回来算两段。
+* 输入 UTC 起止时刻，按采样开始时刻筛左闭右开区间内的合格批次，
+  返回各段实际起止、参数、入选批号，并按参数统计运行段数（试验重复数）。
 
 时刻一律使用带时区的 UTC 时间（如 `2026-11-23T09:00:00Z`），精确到秒。
 """
@@ -51,6 +66,8 @@ def create_app(database_path: str | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> Iterator[None]:
         database.initialize()
+        # 旧 SQLite 卷（尚无工况段表数据）启动时一次性回填；新卷空操作。
+        service.ensure_segments()
         yield
 
     app = FastAPI(
@@ -67,6 +84,17 @@ def create_app(database_path: str | None = None) -> FastAPI:
         return JSONResponse(
             status_code=exc.status_code,
             content={"detail": exc.message, "code": exc.code},
+        )
+
+    @app.exception_handler(ValidationError)
+    async def _pydantic_validation_error(
+        _: Request, exc: ValidationError
+    ) -> JSONResponse:
+        # 依赖内部实例化查询模型时的校验错误，规范成与 body 校验一致的 422。
+        request_error = RequestValidationError(exc.errors())
+        return JSONResponse(
+            status_code=422,
+            content={"detail": jsonable_encoder(request_error.errors())},
         )
 
     def get_service() -> CheckService:
@@ -179,6 +207,30 @@ def create_app(database_path: str | None = None) -> FastAPI:
     )
     def check_batch(batch_no: str, svc: CheckService = Depends(get_service)) -> dict:
         return svc.check_batch(batch_no)
+
+    # ------------------------------------------------------------ 工况分组
+
+    @app.get(
+        "/analysis/condition-groups",
+        response_model=ConditionGroupResponse,
+        tags=["工况分组分析"],
+        summary="按 UTC 起止时刻分组查询合格批次所属的工况段",
+        description=(
+            "输入 UTC 起止时刻，按**采样开始时刻**筛出左闭右开区间 "
+            "`[start, end)` 内当前合格的批次，并归入各自所属的工况段"
+            "（同组参数连续运行只算一段；换参数再调回来算两段）。\n\n"
+            "返回各段工况的实际起止、参数与入选批号；未结束的工况段 "
+            "`ended_at` 为 `null`，并按参数统计运行段数（即试验重复数）。\n\n"
+            "资格与工况段来自同一已提交状态；小范围查询只做索引定位，"
+            "不扫描全线历史，也不逐条读取段内同值切换记录。"
+        ),
+        responses={422: {"description": "时间格式错误或起止时刻不合法"}},
+    )
+    def condition_groups(
+        query: Annotated[ConditionGroupQuery, Depends(condition_group_query)],
+        svc: CheckService = Depends(get_service),
+    ) -> dict:
+        return svc.condition_groups(start=query.start, end=query.end)
 
     return app
 

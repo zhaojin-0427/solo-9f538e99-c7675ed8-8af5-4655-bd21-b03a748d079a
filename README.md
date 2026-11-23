@@ -67,6 +67,36 @@ python -m pytest
 请求失败（参数校验 422、切换时刻冲突 409、重查中途异常）时整个事务回滚，
 日志和核对结果都不改动，批次沿用原结果。
 
+## 工况段与分组查询
+
+做封口参数对照分析时，**同一段连续工况里取出的多个箱样只算一次试验重复**。
+服务把切换时间线压缩成「工况段」——设备以同一组参数连续运行的极大半开区间
+`[started_at, ended_at)`，`ended_at` 为 `null` 表示该段尚未结束：
+
+* 同一组参数连续上报多次仍算**一段**；
+* 参数调成别的、再调回来，前后算**两段**；
+* 首条切换记录之前参数未知，不形成工况段。
+
+工况段持久化在 `condition_segments` 表中，随切换补改在**同一事务内局部增量
+维护**——只更新与有效参数变更时段相交的段（拆组/并组），范围之外的段原样
+保留；补改失败整体回滚，沿用原分组。即使补改的变更时段与所有样本的检查窗口
+都不相交（没有批次被重查），工况段也会正确反映拆组或并组。
+
+`GET /analysis/condition-groups?start=...&end=...` 提供分组查询：
+
+1. 输入 UTC 起止时刻，按**采样开始时刻**筛出左闭右开区间 `[start, end)` 内
+   当前**合格**的批次（不合格批次不入选，但计入 `total_batch_count`）。
+2. 返回区间内各工况段的**实际起止、参数和入选批号**（含没有样本的空段），
+   未结束的工况段 `ended_at` 为 `null`。
+3. `parameter_stats` 按参数统计**运行段数**（即试验重复数）与合格批次数。
+
+资格与工况段在同一只读连接、同一已提交状态下读取。小范围查询只做索引定位
+（`condition_segments.started_at` 唯一索引、`batches.sampling_start` 索引），
+不扫描全线历史，也不逐条读取段内的同值切换记录。
+
+旧版本 SQLite 卷（尚无工况段表数据）启动时会在单个事务内按全量切换日志一次性
+回填工况段，之后的补改走增量维护；沿用原 SQLite 卷，不需要数据迁移脚本。
+
 ## 接口一览
 
 | 方法 | 路径 | 用途 |
@@ -78,6 +108,7 @@ python -m pytest
 | `GET` | `/switches` | 全部切换记录 |
 | `GET` | `/switches/{record_no}` | 单条切换记录 |
 | `PUT` | `/switches/{record_no}` | 补录 / 更正切换记录并增量重查 |
+| `GET` | `/analysis/condition-groups` | 按 UTC 时刻分组查询工况段与合格批次 |
 | `GET` | `/health` | 健康检查 |
 
 ### 示例
@@ -99,6 +130,40 @@ curl -X PUT localhost:8000/switches/SW-0001 -H 'Content-Type: application/json' 
 
 # 按批号查结论
 curl localhost:8000/batches/LOT-2026-001/check
+
+# 工况分组查询：按采样开始时刻筛 [08:00, 16:00) 内合格批次，按工况段归组
+curl -G localhost:8000/analysis/condition-groups \
+  --data-urlencode 'start=2026-11-23T08:00:00Z' \
+  --data-urlencode 'end=2026-11-23T16:00:00Z'
+```
+
+返回示例（节选）：
+
+```json
+{
+  "query": {"start": "2026-11-23T08:00:00Z", "end": "2026-11-23T16:00:00Z"},
+  "segments": [
+    {
+      "started_at": "2026-11-23T07:00:00Z",
+      "ended_at": "2026-11-23T09:00:00Z",
+      "parameters": {"seal_temperature_c": 180.0, "seal_pressure_kpa": 300.0, "dwell_time_s": 1.5},
+      "batch_nos": ["LOT-2026-001", "LOT-2026-002"]
+    },
+    {
+      "started_at": "2026-11-23T10:00:00Z",
+      "ended_at": null,
+      "parameters": {"seal_temperature_c": 180.0, "seal_pressure_kpa": 300.0, "dwell_time_s": 1.5},
+      "batch_nos": ["LOT-2026-004"]
+    }
+  ],
+  "parameter_stats": [
+    {"parameters": {"seal_temperature_c": 180.0, "seal_pressure_kpa": 300.0, "dwell_time_s": 1.5},
+     "segment_count": 2, "batch_count": 3}
+  ],
+  "segment_count": 2,
+  "eligible_batch_count": 3,
+  "total_batch_count": 4
+}
 ```
 
 ## 目录结构
@@ -107,15 +172,18 @@ curl localhost:8000/batches/LOT-2026-001/check
 app/
   main.py         FastAPI 入口与路由
   schemas.py      请求/响应模型（含时区校验）
-  service.py      事务编排、增量重查
+  service.py      事务编排、增量重查、工况分组查询、启动回填
   evaluation.py   纯函数核对逻辑（未知/不符/变更时段）
-  repository.py   SQL 访问
+  segments.py     纯函数工况段压缩与局部增量规划（拆组/并组）
+  repository.py   SQL 访问（含工况段表与索引定位查询）
   db.py           连接、schema、事务
   params.py       封口参数定义与规范化
   timeutil.py     UTC 时间处理
 tests/
-  test_evaluation.py  核对逻辑单测
-  test_api.py         HTTP 端到端测试
+  test_evaluation.py       核对逻辑单测
+  test_segments.py         工况段拆组/并组增量规划单测
+  test_condition_groups.py 分组查询端到端测试
+  test_api.py              HTTP 端到端测试
 ```
 
 ## 已知限制
